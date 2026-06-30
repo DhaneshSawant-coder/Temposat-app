@@ -1,0 +1,10 @@
+streamlit>=1.50
+torch>=2.2
+numpy>=1.26
+opencv-python-headless>=4.9
+Pillow>=10.0
+matplotlib>=3.8
+folium>=0.16
+streamlit-folium>=0.21
+earthengine-api>=0.1.400
+requests>=2.31
