@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.streamlit/secrets.toml
+*.json
+service-account*.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Data downloaded at runtime
+data/
+
+# OS junk
+.DS_Store
+Thumbs.db
