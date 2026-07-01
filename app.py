@@ -50,13 +50,51 @@ st.divider()
 # ── Initialize Earth Engine ────────────────────────────────────────────────
 @st.cache_resource
 def init_ee():
+    """
+    Tries two auth paths, in order:
+    1. Service account credentials from Streamlit secrets (works on
+       Streamlit Community Cloud, where there's no local EE login).
+    2. Locally cached credentials from `earthengine authenticate`
+       (works on your own machine, where you've already logged in).
+    """
+    project_id = "temposat-deploy"
+
+    # Path 1: cloud deployment — service account via st.secrets
     try:
-        ee.Initialize(project='aerial-ether-500308-v5')
+        if "gee_service_account" in st.secrets:
+            sa_info = dict(st.secrets["gee_service_account"])
+            credentials = ee.ServiceAccountCredentials(
+                email = sa_info["client_email"],
+                key_data = None,
+                key_file = None
+            )
+            # ee.ServiceAccountCredentials needs the key as JSON text,
+            # not a dict — reconstruct it from the secrets fields.
+            import json
+            key_json = json.dumps(sa_info)
+            credentials = ee.ServiceAccountCredentials(
+                sa_info["client_email"], key_data=key_json
+            )
+            ee.Initialize(credentials, project=project_id)
+            return True
+    except Exception:
+        pass
+
+    # Path 2: local machine — already-authenticated credentials
+    try:
+        ee.Initialize(project=project_id)
         return True
     except Exception:
         return False
 
 ee_ready = init_ee()
+
+if not ee_ready:
+    st.sidebar.warning(
+        "⚠️ Earth Engine not connected — map mode (real satellite download) "
+        "won't work. Upload mode still works fully. "
+        "See DEPLOYMENT.md for setup."
+    )
 
 # ══════════════════════════════════════════════════════════════════════════
 # DEEP U-NET (temporal prediction model)
@@ -115,7 +153,7 @@ class TempoSatDeepUNet(nn.Module):
         )
         # How much the correction is allowed to shift pixels, at most.
         # Small on purpose — the baseline should dominate, AI only refines it.
-        self.residual_scale = 0.25
+        self.residual_scale = 0.15
 
     def forward(self, t1, t2):
         x  = torch.cat([t1, t2], dim=1)
@@ -168,7 +206,11 @@ def combined_loss(pred, target):
     mse  = nn.functional.mse_loss(pred, target)
     ssim = ssim_loss(pred, target)
     gl   = gradient_loss(pred, target)
-    return 0.4 * mse + 0.4 * ssim + 0.2 * gl
+    # MSE weighted heavily — directly optimizes pixel accuracy, which is
+    # what the residual correction needs to learn. SSIM kept light since
+    # it can reward "blurry but globally similar" output, which fights
+    # the residual's job of adding sharp, local, correct detail.
+    return 0.6 * mse + 0.15 * ssim + 0.25 * gl
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -362,8 +404,15 @@ def to_pil(arr, size=400):
     return Image.fromarray(big)
 
 def smooth(pred):
+    """
+    Light denoise only. The old settings (d=9, sigma=75/75) were tuned for
+    a from-scratch model that produced noisier raw output. With the
+    residual architecture, the prediction already starts from a clean
+    baseline blend — heavy smoothing here just erases the small, accurate
+    corrections the AI added on top of it. Kept gentle on purpose.
+    """
     uint8    = (np.clip(pred, 0, 1) * 255).astype(np.uint8)
-    smoothed = cv2.bilateralFilter(uint8, 9, 75, 75)
+    smoothed = cv2.bilateralFilter(uint8, 5, 25, 25)
     return smoothed.astype(np.float32) / 255.0
 
 
@@ -459,13 +508,58 @@ def train_model(t1, t2, epochs=30):
     return model
 
 
-def predict(model, t1, t2):
+def predict(model, t1, t2, tile_size=96, overlap=16):
+    """
+    Run prediction by tiling the image into TRAIN_SIZE-scale patches that
+    match what the model was actually trained on (random_crops_gpu uses
+    patch_size=96). Running the full 256px image through in one shot causes
+    a train/inference resolution mismatch: with 3 pooling stages, a 96px
+    training patch bottlenecks at 12x12, but a 256px image bottlenecks at
+    32x32 — a scale the BatchNorm statistics and conv receptive fields were
+    never calibrated on. Tiling at the training resolution avoids this.
+
+    Overlapping tiles are blended with a linear-falloff weight mask to
+    avoid visible seams at tile boundaries.
+    """
     with torch.no_grad():
         t1_t = torch.from_numpy(t1).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
         t2_t = torch.from_numpy(t2).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+
+        _, _, H, W = t1_t.shape
+        stride = tile_size - overlap
+
+        out_sum    = torch.zeros((1, 3, H, W), device=DEVICE)
+        weight_sum = torch.zeros((1, 1, H, W), device=DEVICE)
+
+        # 1D linear-falloff weight, outer product to make a 2D blend mask
+        ramp = torch.linspace(0, 1, overlap, device=DEVICE) if overlap > 0 else torch.tensor([], device=DEVICE)
+        w1d  = torch.ones(tile_size, device=DEVICE)
+        if overlap > 0:
+            w1d[:overlap]  = ramp
+            w1d[-overlap:] = ramp.flip(0)
+        tile_weight = (w1d.unsqueeze(0) * w1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)  # (1,1,ts,ts)
+
+        ys = list(range(0, max(1, H - tile_size + 1), stride))
+        xs = list(range(0, max(1, W - tile_size + 1), stride))
+        if not ys or ys[-1] + tile_size < H:
+            ys.append(max(0, H - tile_size))
+        if not xs or xs[-1] + tile_size < W:
+            xs.append(max(0, W - tile_size))
+
         with autocast(enabled=(DEVICE.type == "cuda")):
-            pred = model(t1_t, t2_t)
-        pred = pred.squeeze(0).permute(1, 2, 0).cpu().float().numpy()
+            for y in ys:
+                for x in xs:
+                    t1_tile = t1_t[:, :, y:y+tile_size, x:x+tile_size]
+                    t2_tile = t2_t[:, :, y:y+tile_size, x:x+tile_size]
+                    th, tw  = t1_tile.shape[2], t1_tile.shape[3]
+
+                    pred_tile = model(t1_tile, t2_tile).float()
+                    w_tile    = tile_weight[:, :, :th, :tw]
+
+                    out_sum[:, :, y:y+th, x:x+tw]    += pred_tile * w_tile
+                    weight_sum[:, :, y:y+th, x:x+tw] += w_tile
+
+        pred = (out_sum / weight_sum.clamp(min=1e-6)).squeeze(0).permute(1, 2, 0).cpu().float().numpy()
     return np.clip(pred, 0, 1)
 
 
