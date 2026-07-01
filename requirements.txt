@@ -4,8 +4,8 @@ streamlit==1.38.0
 # Deep learning — CPU build, since Community Cloud has no GPU.
 # (Locally you can keep your CUDA build; this file only controls
 # what gets installed on the deployed server.)
-torch==2.4.1
-torchvision==0.19.1
+torch==2.12.1
+torchvision
 
 # Image / array processing
 numpy==1.26.4
