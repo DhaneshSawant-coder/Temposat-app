@@ -87,3 +87,14 @@ For the Map Mode to work you need a free Google Earth Engine account:
 ---
 
 ## 📁 Project Structure
+
+TempoSat/
+├── app.py # Main Streamlit application
+├── requirements.txt # Python dependencies
+├── README.md # This file
+├── notebooks/ # Jupyter notebooks (development)
+│ ├── 01_test_images.ipynb
+│ ├── 02_ai_model.ipynb
+│ ├── 03_final.ipynb
+│ └── 04_real_satellite.ipynb
+└── .gitignore
