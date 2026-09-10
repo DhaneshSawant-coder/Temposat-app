@@ -50,7 +50,7 @@ between two real satellite captures — no extra satellites needed.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/TempoSat.git
+git clone https://github.com/DhaneshSawant-coder/Temposat-app.git
 cd TempoSat
 
 # 2. Create conda environment
